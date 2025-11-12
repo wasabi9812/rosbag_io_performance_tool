@@ -1,0 +1,8 @@
+byte_publisher:
+  topic_prefix: "/io"
+  topic_count: 5
+  start_index: 0
+  publish_rate: 10.0
+  message_count: "no"
+  payload_size: 2764800   # 1280*720*3
+  frame_id: "camera"
