@@ -73,8 +73,10 @@ fi
   echo "===== df -h ====="; df -h
   echo "===== free -m ====="; free -m
   # 스케줄러 상태(가능하면 nvme 블록만)
-  for b in /sys/block/nvme*n*/queue/scheduler 2>/dev/null; do
-    [[ -e "$b" ]] && echo "===== ${b} =====" && cat "$b"
+  for b in /sys/block/nvme*n*/queue/scheduler; do
+  [[ -e "$b" ]] || continue
+  echo "===== ${b} ====="
+  cat "$b"
   done
   echo "===== mount | grep nvme ====="; mount | grep -i nvme || true
 } > "${OUTDIR}/env_snapshot.txt" 2>&1 || true
