@@ -1,79 +1,113 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# --- 설정 ---
-# 1. 실행 시간을 스크립트의 첫 번째 인자로 받음
-if [ $# -lt 1 ]; then
+# ======= 사용자 조절 옵션(인자 없이 여기만 바꾸면 됨) =======
+DROP_CACHES=1          # 1: 시작 전에 page cache drop( sudo 필요 ), 0: 사용 안 함
+USE_PERF=0             # 1: perf stat 켜기( sudo 권장 ), 0: 끔
+PERF_EVENTS="cycles,instructions,cache-misses,context-switches,cpu-migrations,page-faults"
+PIN_RECORDER_CPU=""    # 예: "0" 로스백 녹화 프로세스를 코어 0에 핀닝. 비우면 사용 안 함.
+# ============================================================
+
+if [[ $# -ne 1 ]]; then
   echo "Usage: $0 <runtime_in_seconds>" >&2
-  echo "Example: ./rosbag_benchmark.sh 30"
   exit 1
 fi
 
-RUNTIME=$1
-LOG_DIR="rosbag_benchmark_$(date +%F_%H-%M-%S)"
-mkdir -p "$LOG_DIR"
-echo "Starting benchmark for $RUNTIME seconds..."
-echo "All logs will be saved in: $LOG_DIR"
+RUNTIME="$1"
+TS="$(date +%F_%H-%M-%S)"
+OUTDIR="rosbag_benchmark_${TS}"
+mkdir -p "$OUTDIR"
+echo "[record] run=${RUNTIME}s  outdir=${OUTDIR}"
 
-# --- 종료 시 모든 백그라운드 프로세스를 정리하는 함수 ---
-# (Ctrl+C를 누르거나 스크립트가 끝나면 실행됨)
-pids_to_kill=()
+# 종속 툴 체크(있으면 사용, 없어도 진행)
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# 종료/중단 시 정리
+PIDS=()
 cleanup() {
   echo
-  echo "Benchmark time ($RUNTIME sec) finished. Cleaning up all background processes..."
-  for pid in "${pids_to_kill[@]}"; do
-    kill "$pid" 2>/dev/null
+  echo "[record] cleaning up..."
+  for pid in "${PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
   done
-  echo "Cleanup done."
+  echo "[record] done. outputs in: ${OUTDIR}"
 }
 trap cleanup EXIT INT TERM
 
-# --- 1. 캐시 비우기 (fio.sh와 동일) ---
-echo "Dropping OS page caches (requires sudo)..."
-sudo bash -c "echo 3 > /proc/sys/vm/drop_caches"
-echo "Caches dropped."
+# (선택) 캐시 드랍
+if [[ "${DROP_CACHES}" -eq 1 ]]; then
+  if [[ $EUID -ne 0 ]]; then
+    echo "[record] dropping caches (sudo)..."
+    sudo bash -c 'echo 3 > /proc/sys/vm/drop_caches' || true
+  else
+    echo 3 > /proc/sys/vm/drop_caches || true
+  fi
+fi
 
-# --- 2. ROS 부하 발생기 (Publisher) 시작 ---
-# (fio의 --numjobs=12와 유사)
-echo "Starting ROS Publisher (multi_robot_image_launch.py) in background..."
-ros2 launch robot_image_publisher multi_robot_image_launch.py &
-LAUNCH_PID=$!
-pids_to_kill+=($LAUNCH_PID)
+# 환경 스냅샷
+{
+  echo "===== uname -a ====="; uname -a
+  echo "===== lscpu ====="; have_cmd lscpu && lscpu || true
+  echo "===== lsblk ====="; have_cmd lsblk && lsblk -o NAME,TYPE,SIZE,ROTA,MOUNTPOINT || true
+  echo "===== df -h ====="; df -h
+  echo "===== free -m ====="; free -m
+} > "${OUTDIR}/env_snapshot.txt" 2>&1 || true
 
-# --- 3. ROS 테스트 대상 (Recorder) 시작 ---
-# (fio의 --filename=/dev/nvme0n1와 유사)
-echo "Starting ROS Recorder (ros2 bag record) in background..."
-ros2 bag record -a -o "$LOG_DIR/my_bag" &
-RECORD_PID=$!
-pids_to_kill+=($RECORD_PID)
+# rosbag 레코더 시작 (-a: 모든 토픽)
+REC_LOG="${OUTDIR}/rosbag_record.log"
+REC_DIR="${OUTDIR}/bag"
 
-# ROS 노드가 뜰 때까지 3초 대기
-sleep 3
+if [[ -n "${PIN_RECORDER_CPU}" ]]; then
+  echo "[record] starting rosbag recorder (pinned to cpu ${PIN_RECORDER_CPU})..."
+  taskset -c "${PIN_RECORDER_CPU}" ros2 bag record -a -o "${REC_DIR}" > "${REC_LOG}" 2>&1 &
+else
+  echo "[record] starting rosbag recorder..."
+  ros2 bag record -a -o "${REC_DIR}" > "${REC_LOG}" 2>&1 &
+fi
+REC_PID=$!
+PIDS+=("${REC_PID}")
+echo "[record] recorder PID=${REC_PID}"
 
-# --- 4. 성능 계측기 (Monitoring) 시작 ---
-echo "Starting all monitors (mpstat, iostat, vmstat)..."
+# 모니터들 시작 (가능한 것만)
+echo "[record] starting monitors..."
+if have_cmd mpstat; then
+  mpstat -P ALL 1 "${RUNTIME}" > "${OUTDIR}/mpstat_cpu.log" 2>&1 &
+  PIDS+=($!)
+fi
+if have_cmd iostat; then
+  iostat -d -x -k 1 "${RUNTIME}" > "${OUTDIR}/iostat_disk.log" 2>&1 &
+  PIDS+=($!)
+fi
+if have_cmd vmstat; then
+  vmstat 1 "${RUNTIME}" > "${OUTDIR}/vmstat_memory.log" 2>&1 &
+  PIDS+=($!)
+fi
+if have_cmd pidstat; then
+  # rosbag 레코더 개별 프로세스의 CPU/메모리/IO 추적
+  pidstat -dur -h -p "${REC_PID}" 1 "${RUNTIME}" > "${OUTDIR}/pidstat_recorder.log" 2>&1 &
+  PIDS+=($!)
+fi
+if [[ "${USE_PERF}" -eq 1 ]] && have_cmd perf; then
+  # system-wide perf (1초 간격 리포트)
+  if [[ $EUID -ne 0 ]]; then
+    echo "[record] starting perf (sudo) ..."
+    sudo perf stat -a -I 1000 -e "${PERF_EVENTS}" -- sleep "${RUNTIME}" > "${OUTDIR}/perf_stat.log" 2>&1 &
+  else
+    perf stat -a -I 1000 -e "${PERF_EVENTS}" -- sleep "${RUNTIME}" > "${OUTDIR}/perf_stat.log" 2>&1 &
+  fi
+  PIDS+=($!)
+fi
 
-# mpstat (CPU 사용률): Lab 2에서 사용
-# -P ALL (모든 코어), 1 (1초 간격)
-mpstat -P ALL 1 $RUNTIME > "$LOG_DIR/mpstat_cpu.log" &
-pids_to_kill+=($!)
+# 지정 시간만큼 대기
+echo "[record] running for ${RUNTIME}s ..."
+sleep "${RUNTIME}"
 
-# iostat (I/O 사용률): 사용자가 요청한 'iostat'
-# -d (디스크만), -x (상세 통계), -k (KB 단위), 1 (1초 간격)
-iostat -d -x -k 1 $RUNTIME > "$LOG_DIR/iostat_disk.log" &
-pids_to_kill+=($!)
+# rosbag 정상 종료(SIGINT) → 메타/인덱스 flush
+echo "[record] stopping recorder (SIGINT) ..."
+kill -2 "${REC_PID}" 2>/dev/null || true
+wait "${REC_PID}" 2>/dev/null || true
 
-# vmstat (메모리 사용률): 사용자가 요청한 'mem'
-# 1 (1초 간격)
-vmstat 1 $RUNTIME > "$LOG_DIR/vmstat_memory.log" &
-pids_to_kill+=($!)
+# dmesg tail 저장(에러 확인용)
+have_cmd dmesg && dmesg | tail -n 200 > "${OUTDIR}/dmesg_tail.txt" 2>&1 || true
 
-# --- 5. 벤치마크 실행 대기 (fio의 --runtime) ---
-echo "Benchmark running... (Publisher: $LAUNCH_PID, Recorder: $RECORD_PID)"
-echo "Monitoring PIDs: ${pids_to_kill[@]:2}"
-echo "Will stop automatically after $RUNTIME seconds. (Press Ctrl+C to stop early)"
-
-# 이 sleep이 메인 타이머입니다.
-sleep $RUNTIME
-
-# --- 6. 종료 ---
-# (스크립트가 여기서 끝나면 'trap'이 cleanup 함수를 자동 호출)
+echo "[record] finished. bag dir: ${REC_DIR}"
