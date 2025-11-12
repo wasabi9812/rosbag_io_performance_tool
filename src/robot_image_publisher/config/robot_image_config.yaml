@@ -1,0 +1,10 @@
+robot_image:
+  robot_count: 5           # 동시에 띄울 퍼블리셔 개수
+  start_index: 0
+  publish_rate: 10.0        # Hz
+  message_count: "no"      # "no" 또는 정수 문자열
+  width: 1280 #1920
+  height: 720 # 1080
+  jpeg_quality: 85
+  pattern: "noise"        # moving | grid | noise | solid
+  frame_id: "camera"
